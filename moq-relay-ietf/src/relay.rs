@@ -53,6 +53,9 @@ pub struct RelayConfig {
 
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
+
+    //수정
+    pub probe: moq_transport::probe::ProbeConfig,
 }
 
 /// MoQ Relay server.
@@ -63,6 +66,8 @@ pub struct Relay {
     locals: Locals,
     remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
+    //수정
+    probe: moq_transport::probe::ProbeConfig,
 }
 
 impl Relay {
@@ -115,6 +120,8 @@ impl Relay {
             locals,
             remotes,
             coordinator: config.coordinator,
+            //수정
+            probe: config.probe,
         })
     }
 
@@ -127,7 +134,11 @@ impl Relay {
             locals,
             remotes,
             coordinator,
+            probe,
         } = self;
+
+        let probe_counters = Arc::new(moq_transport::probe::ProbeCounters::default());
+        moq_transport::probe::install_global_counters(probe_counters.clone());
 
         let run_result = async {
             let mut tasks = FuturesUnordered::new();
@@ -244,6 +255,8 @@ impl Relay {
                         let remotes = remote_manager.clone();
                         let forward = forward_producer.clone();
                         let coordinator = coordinator.clone();
+                        let probe_config = probe.clone();
+                        let probe_counters = probe_counters.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -265,6 +278,23 @@ impl Relay {
                                     return Ok(());
                                 }
                             };
+
+                            if probe_config.enabled {
+                                let probe_wt = raw_conn.clone();
+                                let probe_config_for_task = probe_config.clone();
+                                let probe_counters_for_task = probe_counters.clone();
+                                tokio::spawn(async move {
+                                    if let Err(err) = moq_transport::probe::run_relay_probe_acceptor(
+                                        probe_wt,
+                                        probe_config_for_task,
+                                        probe_counters_for_task,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(?err, "probe acceptor stopped");
+                                    }
+                                });
+                            }
 
                             // Create our MoQ relay session
                             let moq_session = session;

@@ -194,7 +194,14 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
                 object.object_id
             );
             let out = out.clone();
+            
+            //수정
             let buf = Self::recv_object(object).await?;
+
+            if let Some(c) = moq_transport::probe::counters() {
+                c.media_recv_bytes
+                    .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
 
             out.lock().await.write_all(&buf).await?;
         }

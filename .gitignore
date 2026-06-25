@@ -6,6 +6,13 @@
 target/
 logs/
 *.mp4
+*.mov
+*.fmp4
+*.csv
+*.log
+*.pcap
+*.pcapng
+certs/*.key
 result
 qlog/
 /mlog/

@@ -438,7 +438,9 @@ impl StreamObjectWriter {
         if chunk.len() > self.remaining_write_bytes {
             return Err(ServeError::Size);
         }
-        self.remaining_write_bytes -= chunk.len();
+
+        let chunk_len = chunk.len();
+        self.remaining_write_bytes -= chunk_len;
 
         let mut state = self.state.lock_mut().ok_or(ServeError::Cancel)?;
         state.chunks.push(chunk);

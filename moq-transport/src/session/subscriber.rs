@@ -340,10 +340,32 @@ impl Subscriber {
     /// Handle reception of a new stream from the QUIC session.
     pub(super) async fn recv_stream(
         mut self,
-        stream: web_transport::RecvStream,
+        mut stream: web_transport::RecvStream,
     ) -> Result<(), SessionError> {
         tracing::trace!("[SUBSCRIBER] recv_stream: new stream received, decoding header");
-        let mut reader = Reader::new(stream);
+
+        let (stream_type, prefix) = crate::probe::read_varint_from_recv_stream(&mut stream)
+            .await
+            .map_err(|err| {
+                tracing::warn!(?err, "failed to read stream type");
+                SessionError::Internal
+            })?;
+
+        if stream_type == crate::probe::PROBE_PADDING_STREAM_TYPE {
+            let mut total = 0u64;
+            while let Some(chunk) = stream.read(8192).await? {
+                total += chunk.len() as u64;
+            }
+
+            if let Some(c) = crate::probe::counters() {
+                c.padding_stream_recv_bytes
+                    .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            return Ok(());
+        }
+
+        let mut reader = Reader::new_with_prefix(stream, prefix);
 
         // Decode the stream header
         let stream_header: data::StreamHeader = reader.decode().await?;

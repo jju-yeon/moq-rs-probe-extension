@@ -23,6 +23,12 @@ impl Reader {
         }
     }
 
+    pub fn new_with_prefix(stream: web_transport::RecvStream, prefix: Bytes) -> Self {
+        let mut buffer = BytesMut::new();
+        buffer.extend_from_slice(&prefix);
+        Self { stream, buffer }
+    }
+
     pub async fn decode<T: Decode>(&mut self) -> Result<T, SessionError> {
         tracing::trace!(
             "[READER] decode: attempting to decode {} (buffer_len={})",

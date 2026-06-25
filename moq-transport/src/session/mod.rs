@@ -34,6 +34,7 @@ use crate::mlog;
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
+use bytes::Buf;
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
@@ -874,10 +875,13 @@ impl Session {
             tokio::select! {
                 res = webtransport.accept_uni() => {
                     let stream = res?;
-                    let subscriber = subscriber.clone().ok_or(SessionError::RoleViolation)?;
+                    let subscriber = subscriber
+                        .as_ref()
+                        .ok_or(SessionError::RoleViolation)?
+                        .clone();
 
                     tasks.push(async move {
-                        if let Err(err) = Subscriber::recv_stream(subscriber, stream).await {
+                        if let Err(err) = subscriber.recv_stream(stream).await {
                             tracing::warn!("failed to serve stream: {}", err);
                         };
                     });
@@ -893,7 +897,19 @@ impl Session {
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         loop {
+            //수정
             let datagram = webtransport.recv_datagram().await?;
+            let mut b = datagram.clone();
+            if let Ok(t) = crate::probe::get_varint(&mut b) {
+                if t == crate::probe::PROBE_PADDING_DATAGRAM_TYPE {
+                    if let Some(c) = crate::probe::counters() {
+                        c.padding_datagram_recv_bytes
+                            .fetch_add(b.remaining() as u64, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
+            }
+
             subscriber
                 .as_mut()
                 .ok_or(SessionError::RoleViolation)?
