@@ -3,6 +3,7 @@
 use std::{
     fs::File,
     io::{self, BufWriter, Write},
+    ops::Deref,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -131,6 +132,14 @@ pub struct ProbeRequest {
 pub struct ProbeResponse {
     pub request_id: u64,
     pub target_bitrate_bps: u64,
+
+    // Effective paced target used by the relay.
+    // In subscriber_probe.csv this is the average paced target over this probe.
+    pub paced_target_bps: u64,
+
+    // Relay-side QUIC cwnd snapshot in bytes.
+    pub cwnd_bytes: u64,
+
     pub raw_sender_app_bitrate_bps: u64,
     pub corrected_measured_bitrate_bps: u64,
     pub elapsed_ms: u64,
@@ -147,12 +156,42 @@ pub struct ProbeCounters {
     pub media_recv_bytes: AtomicU64,
     pub padding_stream_recv_bytes: AtomicU64,
     pub padding_datagram_recv_bytes: AtomicU64,
+
+    // Relay-side QUIC congestion window, in bytes.
+    // Updated by the relay WebTransport/Quinn session owner.
+    pub cwnd_bytes: AtomicU64,
 }
 
 static GLOBAL_COUNTERS: OnceLock<Arc<ProbeCounters>> = OnceLock::new();
 
 pub fn install_global_counters(counters: Arc<ProbeCounters>) {
     let _ = GLOBAL_COUNTERS.set(counters);
+}
+
+/// Periodically samples the relay-side Quinn congestion window and stores it
+/// in ProbeCounters so probe CSV rows can include cwnd_bytes.
+///
+/// Call this from the relay while you still have the native
+/// web_transport::quinn::Session, before or after converting/cloning it into
+/// the generic web_transport::Session used by MoQT.
+pub fn spawn_cwnd_sampler(
+    session: web_transport::quinn::Session,
+    counters: Arc<ProbeCounters>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let qstats = session.deref().stats();
+            counters
+                .cwnd_bytes
+                .store(qstats.path.cwnd, Ordering::Relaxed);
+
+            if session.close_reason().is_some() {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
 }
 
 pub fn counters() -> Option<&'static Arc<ProbeCounters>> {
@@ -172,6 +211,31 @@ pub fn bitrate_bps(bytes: u64, elapsed_ms: u64) -> u64 {
     } else {
         bytes.saturating_mul(8).saturating_mul(1000) / elapsed_ms
     }
+}
+
+fn paced_probe_target_bps(target_bps: u64, elapsed_ms: u64, duration_ms: u64) -> u64 {
+    if target_bps == 0 || duration_ms == 0 {
+        return 0;
+    }
+
+    const START_PPM: u64 = 250_000; // 25%
+    const FULL_PPM: u64 = 1_000_000; // 100%
+    const RAMP_PORTION_PPM: u64 = 600_000; // first 60% of probe duration
+
+    let ramp_ms = duration_ms
+        .saturating_mul(RAMP_PORTION_PPM)
+        / 1_000_000;
+
+    if ramp_ms == 0 || elapsed_ms >= ramp_ms {
+        return target_bps;
+    }
+
+    let ramp_ppm = START_PPM
+        + (FULL_PPM - START_PPM)
+            .saturating_mul(elapsed_ms)
+            / ramp_ms;
+
+    target_bps.saturating_mul(ramp_ppm) / 1_000_000
 }
 
 pub fn put_varint(out: &mut BytesMut, value: u64) {
@@ -306,6 +370,8 @@ pub fn encode_probe_response(res: &ProbeResponse) -> Bytes {
     let mut payload = BytesMut::new();
     put_varint(&mut payload, res.request_id);
     put_varint(&mut payload, res.target_bitrate_bps);
+    put_varint(&mut payload, res.paced_target_bps);
+    put_varint(&mut payload, res.cwnd_bytes);
     put_varint(&mut payload, res.raw_sender_app_bitrate_bps);
     put_varint(&mut payload, res.corrected_measured_bitrate_bps);
     put_varint(&mut payload, res.elapsed_ms);
@@ -384,46 +450,53 @@ pub async fn read_probe_response_web(
 
     let request_id = get_varint(&mut b)?;
     let target_bitrate_bps = get_varint(&mut b)?;
+
+    // New format fields.
+    // If older responses are mixed in, default to target and 0.
+    let paced_target_bps = if b.has_remaining() {
+        get_varint(&mut b)?
+    } else {
+        target_bitrate_bps
+    };
+
+    let cwnd_bytes = if b.has_remaining() {
+        get_varint(&mut b)?
+    } else {
+        0
+    };
+
     let raw_sender_app_bitrate_bps = get_varint(&mut b)?;
+    let corrected_measured_bitrate_bps = get_varint(&mut b)?;
+    let elapsed_ms = get_varint(&mut b)?;
+    let sender_app_written_bytes = get_varint(&mut b)?;
+    let padding_written_bytes = get_varint(&mut b)?;
+    let media_written_bytes = get_varint(&mut b)?;
 
-    // Backward compatibility with the old Experiment 1 response format:
-    // if only 7 fields were present, this value is actually elapsed_ms.
-    let maybe_corrected_or_elapsed = get_varint(&mut b)?;
+    let correction_factor_ppm = if b.has_remaining() {
+        get_varint(&mut b)?
+    } else {
+        1_000_000
+    };
 
-    if b.remaining() <= 3 * 8 {
-        let elapsed_ms = maybe_corrected_or_elapsed;
-        let sender_app_written_bytes = get_varint(&mut b)?;
-        let padding_written_bytes = get_varint(&mut b)?;
-        let media_written_bytes = get_varint(&mut b)?;
-        return Ok(ProbeResponse {
-            request_id,
-            target_bitrate_bps,
-            raw_sender_app_bitrate_bps,
-            corrected_measured_bitrate_bps: raw_sender_app_bitrate_bps,
-            elapsed_ms,
-            sender_app_written_bytes,
-            padding_written_bytes,
-            media_written_bytes,
-            correction_factor_ppm: 1_000_000,
-            correction_reason_code: CorrectionReasonCode::None,
-        });
-    }
+    let correction_reason_code = if b.has_remaining() {
+        CorrectionReasonCode::try_from(get_varint(&mut b)?)?
+    } else {
+        CorrectionReasonCode::None
+    };
 
     Ok(ProbeResponse {
         request_id,
         target_bitrate_bps,
+        paced_target_bps,
+        cwnd_bytes,
         raw_sender_app_bitrate_bps,
-        corrected_measured_bitrate_bps: maybe_corrected_or_elapsed,
-        elapsed_ms: get_varint(&mut b)?,
-        sender_app_written_bytes: get_varint(&mut b)?,
-        padding_written_bytes: get_varint(&mut b)?,
-        media_written_bytes: get_varint(&mut b)?,
-        correction_factor_ppm: if b.has_remaining() { get_varint(&mut b)? } else { 1_000_000 },
-        correction_reason_code: if b.has_remaining() {
-            CorrectionReasonCode::try_from(get_varint(&mut b)?)?
-        } else {
-            CorrectionReasonCode::None
-        },
+        corrected_measured_bitrate_bps,
+        elapsed_ms,
+        sender_app_written_bytes,
+        padding_written_bytes,
+        media_written_bytes,
+        correction_factor_ppm,
+        correction_reason_code,
     })
 }
 
@@ -436,7 +509,7 @@ impl RelayProbeCsv {
         let mut w = BufWriter::new(File::create(path)?);
         writeln!(
             w,
-            "timestamp_ms,request_id,probe_mode,target_bitrate_bps,attempted_padding_bytes,write_accepted_padding_bytes,accept_ratio_ppm,write_block_time_ms,media_write_bytes,raw_sender_app_bitrate_bps,corrected_measured_bitrate_bps,correction_factor_ppm,correction_reason,epoch_elapsed_ms"
+            "timestamp_ms,request_id,probe_mode,target_bitrate_bps,paced_target_bps,cwnd_bytes,attempted_padding_bytes,write_accepted_padding_bytes,accept_ratio_ppm,write_block_time_ms,media_write_bytes,raw_sender_app_bitrate_bps,corrected_measured_bitrate_bps,correction_factor_ppm,correction_reason,epoch_elapsed_ms"
         )?;
         Ok(Self { w })
     }
@@ -447,6 +520,8 @@ impl RelayProbeCsv {
         request_id: u64,
         probe_mode: ProbeMode,
         target_bitrate_bps: u64,
+        paced_target_bps: u64,
+        cwnd_bytes: u64,
         attempted_padding_bytes: u64,
         write_accepted_padding_bytes: u64,
         write_block_time_ms: u64,
@@ -465,11 +540,13 @@ impl RelayProbeCsv {
 
         writeln!(
             self.w,
-            "{},{},{:?},{},{},{},{},{},{},{},{},{},{:?},{}",
+            "{},{},{:?},{},{},{},{},{},{},{},{},{},{},{},{:?},{}",
             now_ms(),
             request_id,
             probe_mode,
             target_bitrate_bps,
+            paced_target_bps,
+            cwnd_bytes,
             attempted_padding_bytes,
             write_accepted_padding_bytes,
             accept_ratio_ppm,
@@ -495,7 +572,7 @@ impl SubscriberProbeCsv {
         let mut w = BufWriter::new(File::create(path)?);
         writeln!(
             w,
-            "request_id,timestamp_ms,probe_mode,received_media_bytes,received_padding_stream_bytes,received_padding_datagram_bytes,total_received_bytes,receiver_goodput_bps,raw_sender_app_bitrate_bps,corrected_measured_bitrate_bps,target_bitrate_bps,correction_factor_ppm,correction_reason"
+            "request_id,timestamp_ms,probe_mode,received_media_bytes,received_padding_stream_bytes,received_padding_datagram_bytes,total_received_bytes,receiver_goodput_bps,raw_sender_app_bitrate_bps,corrected_measured_bitrate_bps,target_bitrate_bps,paced_target_bps,cwnd_bytes,correction_factor_ppm,correction_reason"
         )?;
         Ok(Self { w })
     }
@@ -512,6 +589,8 @@ impl SubscriberProbeCsv {
         raw_sender_app_bitrate_bps: u64,
         corrected_measured_bitrate_bps: u64,
         target_bitrate_bps: u64,
+        paced_target_bps: u64,
+        cwnd_bytes: u64,
         correction_factor_ppm: u64,
         correction_reason: CorrectionReasonCode,
     ) -> ProbeResult<()> {
@@ -521,7 +600,7 @@ impl SubscriberProbeCsv {
 
         writeln!(
             self.w,
-            "{},{},{:?},{},{},{},{},{},{},{},{},{},{:?}",
+            "{},{},{:?},{},{},{},{},{},{},{},{},{},{},{},{:?}",
             request_id,
             now_ms(),
             probe_mode,
@@ -533,6 +612,8 @@ impl SubscriberProbeCsv {
             raw_sender_app_bitrate_bps,
             corrected_measured_bitrate_bps,
             target_bitrate_bps,
+            paced_target_bps,
+            cwnd_bytes,
             correction_factor_ppm,
             correction_reason,
         )?;
@@ -722,13 +803,26 @@ pub async fn run_relay_probe_acceptor(
         let mut last_corrected = 0u64;
         let mut last_factor = 1_000_000u64;
         let mut last_reason = CorrectionReasonCode::None;
+        let mut paced_target_weighted_sum: u128 = 0;
+        let mut paced_target_weighted_ms: u64 = 0;  
 
         while started.elapsed() < Duration::from_millis(req.probe_duration_ms) {
             let epoch_start = Instant::now();
 
             let media_epoch_start = counters.media_write_bytes.load(Ordering::Relaxed);
 
-            let epoch_budget_bytes = target
+            let probe_elapsed_ms = started
+                .elapsed()
+                .as_millis()
+                .min(req.probe_duration_ms as u128) as u64;
+
+            let paced_target = paced_probe_target_bps(
+                target,
+                probe_elapsed_ms,
+                req.probe_duration_ms,
+            );
+
+            let epoch_budget_bytes = paced_target
                 .saturating_mul(req.epoch_ms)
                 / 8
                 / 1000;
@@ -754,7 +848,18 @@ pub async fn run_relay_probe_acceptor(
                             break;
                         }
 
-                        let allowed_total_bytes = target
+                        let probe_elapsed_ms = started
+                            .elapsed()
+                            .as_millis()
+                            .min(req.probe_duration_ms as u128) as u64;
+
+                        let paced_target = paced_probe_target_bps(
+                            target,
+                            probe_elapsed_ms,
+                            req.probe_duration_ms,
+                        );
+
+                        let allowed_total_bytes = paced_target
                             .saturating_mul(epoch_elapsed_ms)
                             / 8
                             / 1000;
@@ -799,7 +904,18 @@ pub async fn run_relay_probe_acceptor(
                             break;
                         }
 
-                        let allowed_total_bytes = target
+                        let probe_elapsed_ms = started
+                            .elapsed()
+                            .as_millis()
+                            .min(req.probe_duration_ms as u128) as u64;
+
+                        let paced_target = paced_probe_target_bps(
+                            target,
+                            probe_elapsed_ms,
+                            req.probe_duration_ms,
+                        );
+
+                        let allowed_total_bytes = paced_target
                             .saturating_mul(epoch_elapsed_ms)
                             / 8
                             / 1000;
@@ -846,6 +962,13 @@ pub async fn run_relay_probe_acceptor(
             total_padding_written += accepted_padding_bytes;
 
             let epoch_elapsed_ms = epoch_start.elapsed().as_millis().max(1) as u64;
+            paced_target_weighted_sum = paced_target_weighted_sum
+                .saturating_add((paced_target as u128).saturating_mul(epoch_elapsed_ms as u128));
+
+            paced_target_weighted_ms = paced_target_weighted_ms
+                .saturating_add(epoch_elapsed_ms);
+
+            let cwnd_bytes = counters.cwnd_bytes.load(Ordering::Relaxed);
 
             let media_written = counters
                 .media_write_bytes
@@ -888,14 +1011,21 @@ pub async fn run_relay_probe_acceptor(
             last_reason = correction.reason;
 
             if let Some(csv) = &mut csv {
+                let media_epoch_bytes = counters
+                    .media_write_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(media_epoch_start);
+
                 csv.row(
                     req.request_id,
                     req.mode,
                     target,
+                    paced_target,
+                    cwnd_bytes,
                     attempted_padding_bytes,
                     accepted_padding_bytes,
                     write_block_time_ms,
-                    media_written,
+                    media_epoch_bytes,
                     raw,
                     correction.corrected_bitrate_bps,
                     correction.correction_factor_ppm,
@@ -922,9 +1052,19 @@ pub async fn run_relay_probe_acceptor(
             ProbeMode::Corrected => if last_corrected == 0 { raw } else { last_corrected },
         };
 
+        let avg_paced_target_bps = if paced_target_weighted_ms == 0 {
+            target
+        } else {
+            (paced_target_weighted_sum / paced_target_weighted_ms as u128) as u64
+        };
+
+        let cwnd_bytes = counters.cwnd_bytes.load(Ordering::Relaxed);
+
         let res = ProbeResponse {
             request_id: req.request_id,
             target_bitrate_bps: target,
+            paced_target_bps: avg_paced_target_bps,
+            cwnd_bytes,
             raw_sender_app_bitrate_bps: raw,
             corrected_measured_bitrate_bps: corrected,
             elapsed_ms,

@@ -217,7 +217,7 @@ async fn run_probe_client(
         previous_receiver_goodput_bps.store(receiver_goodput_bps, Ordering::Relaxed);
 
         csv.row(
-            request_id,
+            res.request_id,
             mode,
             media,
             padding_stream,
@@ -226,6 +226,8 @@ async fn run_probe_client(
             res.raw_sender_app_bitrate_bps,
             res.corrected_measured_bitrate_bps,
             res.target_bitrate_bps,
+            res.paced_target_bps,
+            res.cwnd_bytes,
             res.correction_factor_ppm,
             res.correction_reason_code,
         )?;
