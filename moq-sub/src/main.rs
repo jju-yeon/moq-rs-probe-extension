@@ -196,50 +196,90 @@ async fn run_probe_client(
         let raw_req = probe::encode_probe_request(&req);
         probe::write_all_web(&mut send, &raw_req).await?;
 
-        let res = probe::read_probe_response_web(&mut recv).await?;
+        send.finish()?;
 
-        let elapsed_ms = started.elapsed().as_millis().max(1) as u64;
+        let mut sample_index = 0u64;
 
-        let media_end = counters.media_recv_bytes.load(Ordering::Relaxed);
-        let ps_end = counters.padding_stream_recv_bytes.load(Ordering::Relaxed);
-        let pd_end = counters.padding_datagram_recv_bytes.load(Ordering::Relaxed);
+        let mut media_last = media_start;
+        let mut ps_last = ps_start;
+        let mut pd_last = pd_start;
 
-        let media = media_end.saturating_sub(media_start);
-        let padding_stream = ps_end.saturating_sub(ps_start);
-        let padding_datagram = pd_end.saturating_sub(pd_start);
+        let mut last_sample_at = Instant::now();
 
-        let total_received = media
-            .saturating_add(padding_stream)
-            .saturating_add(padding_datagram);
+        loop {
+            let res = match probe::read_probe_response_web(&mut recv).await {
+                Ok(res) => res,
+                Err(probe::ProbeError::EndOfStream) => break,
+                Err(err) => return Err(err.into()),
+            };
 
-        let receiver_goodput_bps = probe::bitrate_bps(total_received, elapsed_ms);
+            sample_index += 1;
 
-        previous_receiver_goodput_bps.store(receiver_goodput_bps, Ordering::Relaxed);
+            let sample_elapsed_ms = last_sample_at.elapsed().as_millis().max(1) as u64;
+            last_sample_at = Instant::now();
 
-        csv.row(
-            res.request_id,
-            mode,
-            media,
-            padding_stream,
-            padding_datagram,
-            receiver_goodput_bps,
-            res.raw_sender_app_bitrate_bps,
-            res.corrected_measured_bitrate_bps,
-            res.target_bitrate_bps,
-            res.paced_target_bps,
-            res.cwnd_bytes,
-            res.correction_factor_ppm,
-            res.correction_reason_code,
-        )?;
+            let probe_elapsed_ms = started.elapsed().as_millis().max(1) as u64;
+
+            let media_now = counters.media_recv_bytes.load(Ordering::Relaxed);
+            let ps_now = counters.padding_stream_recv_bytes.load(Ordering::Relaxed);
+            let pd_now = counters.padding_datagram_recv_bytes.load(Ordering::Relaxed);
+
+            let media = media_now.saturating_sub(media_last);
+            let padding_stream = ps_now.saturating_sub(ps_last);
+            let padding_datagram = pd_now.saturating_sub(pd_last);
+
+            media_last = media_now;
+            ps_last = ps_now;
+            pd_last = pd_now;
+
+            let total_received = media
+                .saturating_add(padding_stream)
+                .saturating_add(padding_datagram);
+
+            let receiver_goodput_bps = probe::bitrate_bps(total_received, sample_elapsed_ms);
+            previous_receiver_goodput_bps.store(receiver_goodput_bps, Ordering::Relaxed);
+
+            csv.row(
+                res.request_id,
+                sample_index,
+                mode,
+                probe_elapsed_ms,
+                res.elapsed_ms,
+                media,
+                padding_stream,
+                padding_datagram,
+                receiver_goodput_bps,
+                res.sender_app_written_bytes,
+                res.media_written_bytes,
+                res.padding_written_bytes,
+                res.raw_sender_app_bitrate_bps,
+                res.corrected_measured_bitrate_bps,
+                res.target_bitrate_bps,
+                res.paced_target_bps,
+                res.cwnd_bytes,
+                res.correction_factor_ppm,
+                res.correction_reason_code,
+            )?;
+
+            tracing::info!(
+                request_id = res.request_id,
+                sample_index,
+                probe_index = i + 1,
+                probe_count = config.probe_count,
+                target_bitrate_bps = res.target_bitrate_bps,
+                paced_target_bps = res.paced_target_bps,
+                raw_sender_app_bitrate_bps = res.raw_sender_app_bitrate_bps,
+                corrected_measured_bitrate_bps = res.corrected_measured_bitrate_bps,
+                receiver_goodput_bps,
+                "probe sample received"
+            );
+        }
 
         tracing::info!(
             request_id,
             probe_index = i + 1,
             probe_count = config.probe_count,
-            target_bitrate_bps = res.target_bitrate_bps,
-            raw_sender_app_bitrate_bps = res.raw_sender_app_bitrate_bps,
-            corrected_measured_bitrate_bps = res.corrected_measured_bitrate_bps,
-            receiver_goodput_bps,
+            samples = sample_index,
             "probe completed"
         );
 

@@ -18,3 +18,4 @@ qlog/
 /mlog/
 .vscode/launch.json
 /target
+*.err
