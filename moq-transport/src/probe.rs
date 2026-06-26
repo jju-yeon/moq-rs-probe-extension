@@ -25,6 +25,11 @@ pub const PROBE_PADDING_DATAGRAM_TYPE: u64 = 0x132B3E29;
 pub const MSG_PROBE_REQUEST: u64 = 0x01;
 pub const MSG_PROBE_RESPONSE: u64 = 0x02;
 
+// Quinn SendStream priority: higher value means higher priority.
+pub const PROBE_PRIORITY: i32 = 255;
+pub const MEDIA_PRIORITY: u8 = 128;
+pub const PADDING_PRIORITY: i32 = 0;
+
 #[derive(Debug, Error)]
 pub enum ProbeError {
     #[error("webtransport error: {0}")]
@@ -805,6 +810,7 @@ pub async fn run_relay_probe_acceptor(
 
     loop {
         let (mut send, mut recv) = webtransport.accept_bi().await?;
+		let _ = send.set_priority(PROBE_PRIORITY);
         let stream_type = read_varint_web(&mut recv).await?;
 
         if stream_type != PROBE_STREAM_TYPE {
@@ -845,7 +851,7 @@ pub async fn run_relay_probe_acceptor(
             match req.padding_mode {
                 PaddingMode::Stream => {
                     let mut uni = webtransport.open_uni().await?;
-                    uni.set_priority(255);
+                    uni.set_priority(0);
 
                     write_varint_web(&mut uni, PROBE_PADDING_STREAM_TYPE).await?;
 

@@ -5,6 +5,7 @@
 use anyhow::{self, Context};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use moq_transport::serve::{SubgroupWriter, SubgroupsWriter, TrackWriter, TracksWriter};
+use moq_transport::probe;
 use mp4::{self, ReadBox, TrackType};
 use std::cmp::max;
 use std::collections::HashMap;
@@ -368,7 +369,7 @@ impl Track {
         // Prioritize each group equally for now
         // (A u8 doesn't give us granularity for ms since epoch)
         // TODO: Revisit post draft-05 prioritization
-        let priority: u8 = 127;
+        let priority: u8 = probe::MEDIA_PRIORITY;
 
         // Create a new segment.
         let segment = self.track.append(priority)?;

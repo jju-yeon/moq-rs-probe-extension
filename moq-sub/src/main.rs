@@ -175,6 +175,7 @@ async fn run_probe_client(
         let started = Instant::now();
 
         let (mut send, mut recv) = wt.open_bi().await?;
+		let _ = send.set_priority(probe::PROBE_PRIORITY);
 
         probe::write_varint_web(&mut send, probe::PROBE_STREAM_TYPE).await?;
 
