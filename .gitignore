@@ -17,3 +17,4 @@ result
 qlog/
 /mlog/
 .vscode/launch.json
+/target
