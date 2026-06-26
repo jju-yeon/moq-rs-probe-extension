@@ -280,11 +280,6 @@ impl Relay {
                             };
 
                             if probe_config.enabled {
-                                moq_transport::probe::spawn_cwnd_sampler(
-                                    raw_conn.clone(),
-                                    probe_counters.clone(),
-                                );
-
                                 let probe_wt = raw_conn.clone();
                                 let probe_config_for_task = probe_config.clone();
                                 let probe_counters_for_task = probe_counters.clone();
