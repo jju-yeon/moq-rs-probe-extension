@@ -17,8 +17,9 @@ use thiserror::Error;
 /// Experimental private values.
 /// Replace these after IANA / draft values are assigned.
 pub const PROBE_STREAM_TYPE: u64 = 0xff00_0001;
-pub const PROBE_PADDING_STREAM_TYPE: u64 = 0xff00_0002;
-pub const PROBE_PADDING_DATAGRAM_TYPE: u64 = 0xff00_0003;
+// MOQT padding types
+pub const PROBE_PADDING_STREAM_TYPE: u64 = 0x132B3E28;
+pub const PROBE_PADDING_DATAGRAM_TYPE: u64 = 0x132B3E29;
 
 pub const MSG_PROBE_REQUEST: u64 = 0x01;
 pub const MSG_PROBE_RESPONSE: u64 = 0x02;
@@ -741,6 +742,8 @@ pub async fn run_relay_probe_acceptor(
             match req.padding_mode {
                 PaddingMode::Stream => {
                     let mut uni = webtransport.open_uni().await?;
+                    // QoS 후순위 배치
+                    uni.set_priority(255);
                     write_varint_web(&mut uni, PROBE_PADDING_STREAM_TYPE).await?;
 
                     loop {
