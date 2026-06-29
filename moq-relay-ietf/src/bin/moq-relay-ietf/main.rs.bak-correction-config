@@ -221,6 +221,12 @@ async fn main() -> anyhow::Result<()> {
             enabled: cli.probe_enable,
             log: cli.probe_log.clone(),
             max_target_bitrate_bps: cli.probe_max_target_bitrate,
+            correction: moq_transport::probe::CorrectionConfig {
+                growth_limit_ppm: cli.probe_growth_limit_ppm,
+                min_accept_ratio_ppm: cli.probe_min_accept_ratio_ppm,
+                write_lag_threshold_ppm: cli.probe_write_lag_threshold_ppm,
+                ..Default::default()
+            },
         },
     })?;
 

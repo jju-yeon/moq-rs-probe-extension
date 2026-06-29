@@ -4,7 +4,10 @@
 
 use std::{
     net,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
@@ -118,6 +121,9 @@ pub struct Config {
     #[arg(long, default_value = "500")]
     pub probe_epoch_ms: u64,
 
+    /// Probe mode: baseline or corrected.
+    #[arg(long, default_value = "corrected")]
+    pub probe_mode: String,
 
     /// Probe padding mode: stream or datagram.
     #[arg(long, default_value = "stream")]
@@ -127,6 +133,9 @@ pub struct Config {
     #[arg(long)]
     pub probe_log: Option<std::path::PathBuf>,
 
+    /// Include previous receiver goodput feedback in next probe request.
+    #[arg(long)]
+    pub probe_receiver_assisted: bool,
 }
 
 
@@ -141,6 +150,11 @@ async fn run_probe_client(
         other => anyhow::bail!("invalid --probe-padding-mode: {other}"),
     };
 
+    let mode = match config.probe_mode.as_str() {
+        "baseline" => probe::ProbeMode::Baseline,
+        "corrected" => probe::ProbeMode::Corrected,
+        other => anyhow::bail!("invalid --probe-mode: {other}"),
+    };
 
     let log = config
         .probe_log
@@ -149,6 +163,7 @@ async fn run_probe_client(
 
     let mut csv = probe::SubscriberProbeCsv::new(log)?;
 
+    let previous_receiver_goodput_bps = AtomicU64::new(0);
 
     for i in 0..config.probe_count {
         let request_id = probe::now_ms();
@@ -170,6 +185,13 @@ async fn run_probe_client(
             probe_duration_ms: config.probe_duration_ms,
             epoch_ms: config.probe_epoch_ms,
             padding_mode,
+            mode,
+            receiver_assisted: config.probe_receiver_assisted,
+            previous_receiver_goodput_bps: if config.probe_receiver_assisted {
+                previous_receiver_goodput_bps.load(Ordering::Relaxed)
+            } else {
+                0
+            },
         };
 
         let raw_req = probe::encode_probe_request(&req);
@@ -216,10 +238,12 @@ async fn run_probe_client(
                 .saturating_add(padding_datagram);
 
             let receiver_goodput_bps = probe::bitrate_bps(total_received, sample_elapsed_ms);
+            previous_receiver_goodput_bps.store(receiver_goodput_bps, Ordering::Relaxed);
 
             csv.row(
                 res.request_id,
                 sample_index,
+                mode,
                 probe_elapsed_ms,
                 res.elapsed_ms,
                 media,
@@ -230,9 +254,12 @@ async fn run_probe_client(
                 res.media_written_bytes,
                 res.padding_written_bytes,
                 res.raw_sender_app_bitrate_bps,
+                res.corrected_measured_bitrate_bps,
                 res.target_bitrate_bps,
                 res.paced_target_bps,
                 res.cwnd_bytes,
+                res.correction_factor_ppm,
+                res.correction_reason_code,
             )?;
 
             tracing::info!(
@@ -243,6 +270,7 @@ async fn run_probe_client(
                 target_bitrate_bps = res.target_bitrate_bps,
                 paced_target_bps = res.paced_target_bps,
                 raw_sender_app_bitrate_bps = res.raw_sender_app_bitrate_bps,
+                corrected_measured_bitrate_bps = res.corrected_measured_bitrate_bps,
                 receiver_goodput_bps,
                 "probe sample received"
             );
