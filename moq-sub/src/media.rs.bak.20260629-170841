@@ -187,46 +187,29 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
     async fn recv_group(mut group: SubgroupReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
         trace!("group={} start", group.group_id);
-
         while let Some(object) = group.next().await? {
             trace!(
                 "group={} fragment={} start",
                 group.group_id,
                 object.object_id
             );
-
             let out = out.clone();
-            Self::recv_object_to_output(object, out).await?;
-        }
-
-        Ok(())
-}
-
-    
-    async fn recv_object_to_output(
-        mut object: SubgroupObjectReader,
-        out: Arc<Mutex<impl AsyncWrite + Unpin>>,
-    ) -> anyhow::Result<()> {
-        while let Some(chunk) = object.read().await? {
-            if chunk.is_empty() {
-                continue;
-            }
+            
+            //수정
+            let buf = Self::recv_object(object).await?;
 
             if let Some(c) = moq_transport::probe::counters() {
-                c.media_recv_bytes.fetch_add(
-                    chunk.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                c.media_recv_bytes
+                    .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
 
-            let mut output = out.lock().await;
-            output.write_all(&chunk).await?;
-            output.flush().await?;
+            out.lock().await.write_all(&buf).await?;
         }
 
         Ok(())
     }
-async fn recv_object(mut object: SubgroupObjectReader) -> anyhow::Result<Vec<u8>> {
+
+    async fn recv_object(mut object: SubgroupObjectReader) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(object.size);
         while let Some(chunk) = object.read().await? {
             buf.extend_from_slice(&chunk);
