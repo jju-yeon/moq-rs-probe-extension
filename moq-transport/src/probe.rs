@@ -609,9 +609,13 @@ pub async fn run_relay_probe_acceptor(
         None => None,
     };
 
+    // Keep the last observed non-zero media input rate across probe requests.
+    // Padding is not sent until at least one media epoch has been observed.
+    let mut remembered_media_bps: Option<u64> = None;
+
     loop {
         let (mut send, mut recv) = webtransport.accept_bi().await?;
-		let _ = send.set_priority(PROBE_PRIORITY);
+        let _ = send.set_priority(PROBE_PRIORITY);
         let stream_type = read_varint_web(&mut recv).await?;
 
         if stream_type != PROBE_STREAM_TYPE {
@@ -623,9 +627,7 @@ pub async fn run_relay_probe_acceptor(
         let target = req.target_bitrate_bps.min(config.max_target_bitrate_bps);
         let started = Instant::now();
 
-        let media_probe_start = counters.media_write_bytes.load(Ordering::Relaxed);
         let mut accepted_padding_total = 0u64;
-
         let mut sample_index = 0u64;
         let mut last_response_at = Instant::now();
 
@@ -646,262 +648,170 @@ pub async fn run_relay_probe_acceptor(
                 req.probe_duration_ms,
             );
 
-            // Freeze the paced target for this epoch. Recomputing the ramp target
-            // inside the epoch applies a later target to the full elapsed epoch
-            // and overfills lower pacing steps.
-            let epoch_paced_target = paced_target;
-
             let mut attempted_padding_bytes = 0u64;
             let mut accepted_padding_bytes = 0u64;
             let mut write_block_time_ms = 0u64;
 
             let padding_buf = vec![0u8; 1200];
 
-            match req.padding_mode {
-
-                PaddingMode::Stream => {
-
-                    let mut uni = webtransport.open_uni().await?;
-
-                    uni.set_priority(0);
-
-                    write_varint_web(&mut uni, PROBE_PADDING_STREAM_TYPE).await?;
-
-
-                    loop {
-
-                        let epoch_elapsed_ms = epoch_start
-
-                            .elapsed()
-
-                            .as_millis()
-
-                            .min(req.epoch_ms as u128) as u64;
-
-                        if epoch_elapsed_ms >= req.epoch_ms {
-
-                            break;
-
-                        }
-
-
-                        let probe_elapsed_ms = started
-
-                            .elapsed()
-
-                            .as_millis()
-
-                            .min(req.probe_duration_ms as u128) as u64;
-
-                        let current_paced_target = paced_probe_target_bps(
-
-                            target,
-
-                            probe_elapsed_ms,
-
-                            req.probe_duration_ms,
-
-                        );
-
-                        let allowed_total_bytes = paced_probe_allowed_bytes(
-
-                            target,
-
-                            probe_elapsed_ms,
-
-                            req.probe_duration_ms,
-
-                        );
-
-                        let media_probe_bytes = counters
-
-                            .media_write_bytes
-
-                            .load(Ordering::Relaxed)
-
-                            .saturating_sub(media_probe_start);
-
-                        let current_total_bytes = media_probe_bytes.saturating_add(accepted_padding_total);
-
-
-                        if allowed_total_bytes <= current_total_bytes {
-
-                            tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
-
-                            continue;
-
-                        }
-
-
-                        let gap = allowed_total_bytes.saturating_sub(current_total_bytes);
-
-                        let tick_budget = current_paced_target
-
-                            .saturating_mul(PADDING_PACING_TICK_MS)
-
-                            / 8
-
-                            / 1000;
-
-                        let mut tick_remaining = gap.min(tick_budget.max(1));
-
-
-                        while tick_remaining > 0 {
-
-                            let n = tick_remaining.min(padding_buf.len() as u64) as usize;
-
-                            attempted_padding_bytes += n as u64;
-
-                            let t0 = Instant::now();
-
-                            write_all_web(&mut uni, &padding_buf[..n]).await?;
-
-                            write_block_time_ms += t0.elapsed().as_millis() as u64;
-
-                            accepted_padding_bytes += n as u64;
-
-                            accepted_padding_total += n as u64;
-
-                            tick_remaining = tick_remaining.saturating_sub(n as u64);
-
-                        }
-
-
-                        tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
-
-                    }
-
-                    uni.finish()?;
-
-                }
-
-                PaddingMode::Datagram => {
-
-                    'datagram_padding: loop {
-
-                        let epoch_elapsed_ms = epoch_start
-
-                            .elapsed()
-
-                            .as_millis()
-
-                            .min(req.epoch_ms as u128) as u64;
-
-                        if epoch_elapsed_ms >= req.epoch_ms {
-
-                            break;
-
-                        }
-
-
-                        let probe_elapsed_ms = started
-
-                            .elapsed()
-
-                            .as_millis()
-
-                            .min(req.probe_duration_ms as u128) as u64;
-
-                        let current_paced_target = paced_probe_target_bps(
-
-                            target,
-
-                            probe_elapsed_ms,
-
-                            req.probe_duration_ms,
-
-                        );
-
-                        let allowed_total_bytes = paced_probe_allowed_bytes(
-
-                            target,
-
-                            probe_elapsed_ms,
-
-                            req.probe_duration_ms,
-
-                        );
-
-                        let media_probe_bytes = counters
-
-                            .media_write_bytes
-
-                            .load(Ordering::Relaxed)
-
-                            .saturating_sub(media_probe_start);
-
-                        let current_total_bytes = media_probe_bytes.saturating_add(accepted_padding_total);
-
-
-                        if allowed_total_bytes <= current_total_bytes {
-
-                            tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
-
-                            continue;
-
-                        }
-
-
-                        let gap = allowed_total_bytes.saturating_sub(current_total_bytes);
-
-                        let tick_budget = current_paced_target
-
-                            .saturating_mul(PADDING_PACING_TICK_MS)
-
-                            / 8
-
-                            / 1000;
-
-                        let mut tick_remaining = gap.min(tick_budget.max(1));
-
-
-                        while tick_remaining > 0 {
-
-                            let n = tick_remaining.min(1100) as usize;
-
-                            attempted_padding_bytes += n as u64;
-
-                            let mut d = BytesMut::new();
-
-                            put_varint(&mut d, PROBE_PADDING_DATAGRAM_TYPE);
-
-                            d.extend_from_slice(&padding_buf[..n]);
-
-                            let t0 = Instant::now();
-
-                            match webtransport.send_datagram(d.freeze()).await {
-
-                                Ok(()) => {
-
-                                    accepted_padding_bytes += n as u64;
-
-                                    accepted_padding_total += n as u64;
-
-                                }
-
-                                Err(err) => {
-
-                                    tracing::debug!(?err, "probe padding datagram was not accepted");
-
-                                    break 'datagram_padding;
-
-                                }
-
+            // Freeze the remembered media rate for this epoch. The value is updated
+            // only after the epoch finishes, so the padding decision always uses the
+            // previously observed media_bps rather than the current probe's partial input.
+            let padding_media_bps = remembered_media_bps;
+
+            if let Some(media_bps_for_padding) = padding_media_bps {
+                match req.padding_mode {
+                    PaddingMode::Stream => {
+                        let mut uni = webtransport.open_uni().await?;
+                        let _ = uni.set_priority(PADDING_PRIORITY);
+                        write_varint_web(&mut uni, PROBE_PADDING_STREAM_TYPE).await?;
+
+                        loop {
+                            let epoch_elapsed_ms = epoch_start
+                                .elapsed()
+                                .as_millis()
+                                .min(req.epoch_ms as u128) as u64;
+
+                            if epoch_elapsed_ms >= req.epoch_ms {
+                                break;
                             }
 
-                            write_block_time_ms += t0.elapsed().as_millis() as u64;
+                            let probe_elapsed_ms = started
+                                .elapsed()
+                                .as_millis()
+                                .min(req.probe_duration_ms as u128) as u64;
 
-                            tick_remaining = tick_remaining.saturating_sub(n as u64);
+                            let current_paced_target = paced_probe_target_bps(
+                                target,
+                                probe_elapsed_ms,
+                                req.probe_duration_ms,
+                            );
 
+                            let allowed_total_bytes = paced_probe_allowed_bytes(
+                                target,
+                                probe_elapsed_ms,
+                                req.probe_duration_ms,
+                            );
+
+                            let estimated_media_bytes = media_bps_for_padding
+                                .saturating_mul(probe_elapsed_ms)
+                                / 8
+                                / 1000;
+
+                            let current_total_bytes = estimated_media_bytes
+                                .saturating_add(accepted_padding_total);
+
+                            if allowed_total_bytes <= current_total_bytes {
+                                tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
+                                continue;
+                            }
+
+                            let gap = allowed_total_bytes.saturating_sub(current_total_bytes);
+                            let tick_budget = current_paced_target
+                                .saturating_mul(PADDING_PACING_TICK_MS)
+                                / 8
+                                / 1000;
+                            let mut tick_remaining = gap.min(tick_budget.max(1));
+
+                            while tick_remaining > 0 {
+                                let n = tick_remaining.min(padding_buf.len() as u64) as usize;
+
+                                attempted_padding_bytes += n as u64;
+                                let t0 = Instant::now();
+                                write_all_web(&mut uni, &padding_buf[..n]).await?;
+                                write_block_time_ms += t0.elapsed().as_millis() as u64;
+                                accepted_padding_bytes += n as u64;
+                                accepted_padding_total += n as u64;
+                                tick_remaining = tick_remaining.saturating_sub(n as u64);
+                            }
+
+                            tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
                         }
 
-
-                        tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
-
+                        uni.finish()?;
                     }
 
-                }
+                    PaddingMode::Datagram => {
+                        'datagram_padding: loop {
+                            let epoch_elapsed_ms = epoch_start
+                                .elapsed()
+                                .as_millis()
+                                .min(req.epoch_ms as u128) as u64;
 
+                            if epoch_elapsed_ms >= req.epoch_ms {
+                                break;
+                            }
+
+                            let probe_elapsed_ms = started
+                                .elapsed()
+                                .as_millis()
+                                .min(req.probe_duration_ms as u128) as u64;
+
+                            let current_paced_target = paced_probe_target_bps(
+                                target,
+                                probe_elapsed_ms,
+                                req.probe_duration_ms,
+                            );
+
+                            let allowed_total_bytes = paced_probe_allowed_bytes(
+                                target,
+                                probe_elapsed_ms,
+                                req.probe_duration_ms,
+                            );
+
+                            let estimated_media_bytes = media_bps_for_padding
+                                .saturating_mul(probe_elapsed_ms)
+                                / 8
+                                / 1000;
+
+                            let current_total_bytes = estimated_media_bytes
+                                .saturating_add(accepted_padding_total);
+
+                            if allowed_total_bytes <= current_total_bytes {
+                                tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
+                                continue;
+                            }
+
+                            let gap = allowed_total_bytes.saturating_sub(current_total_bytes);
+                            let tick_budget = current_paced_target
+                                .saturating_mul(PADDING_PACING_TICK_MS)
+                                / 8
+                                / 1000;
+                            let mut tick_remaining = gap.min(tick_budget.max(1));
+
+                            while tick_remaining > 0 {
+                                let n = tick_remaining.min(1100) as usize;
+
+                                attempted_padding_bytes += n as u64;
+
+                                let mut d = BytesMut::new();
+                                put_varint(&mut d, PROBE_PADDING_DATAGRAM_TYPE);
+                                d.extend_from_slice(&padding_buf[..n]);
+
+                                let t0 = Instant::now();
+                                match webtransport.send_datagram(d.freeze()).await {
+                                    Ok(()) => {
+                                        accepted_padding_bytes += n as u64;
+                                        accepted_padding_total += n as u64;
+                                    }
+                                    Err(err) => {
+                                        tracing::debug!(?err, "probe padding datagram was not accepted");
+                                        break 'datagram_padding;
+                                    }
+                                }
+                                write_block_time_ms += t0.elapsed().as_millis() as u64;
+                                tick_remaining = tick_remaining.saturating_sub(n as u64);
+                            }
+
+                            tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
+                        }
+                    }
+                }
+            } else {
+                // No previous media input has been observed yet, so this epoch is
+                // media-only. This prevents initial probe epochs from being filled
+                // entirely with padding before real media_bps is known.
+                tokio::time::sleep(Duration::from_millis(req.epoch_ms)).await;
             }
 
             let epoch_elapsed_ms = epoch_start.elapsed().as_millis().max(1) as u64;
@@ -914,6 +824,11 @@ pub async fn run_relay_probe_acceptor(
                 .media_write_bytes
                 .load(Ordering::Relaxed)
                 .saturating_sub(media_epoch_start);
+
+            let media_epoch_bps = bitrate_bps(media_epoch_bytes, epoch_elapsed_ms);
+            if media_epoch_bytes > 0 && media_epoch_bps > 0 {
+                remembered_media_bps = Some(media_epoch_bps);
+            }
 
             let sender_app_written =
                 media_epoch_bytes.saturating_add(accepted_padding_bytes);
@@ -955,6 +870,7 @@ pub async fn run_relay_probe_acceptor(
                 sample_index,
                 target_bitrate_bps = res.target_bitrate_bps,
                 paced_target_bps = res.paced_target_bps,
+                remembered_media_bps = remembered_media_bps.unwrap_or(0),
                 raw_sender_app_bitrate_bps = res.raw_sender_app_bitrate_bps,
                 "PROBE_RESPONSE sample sent"
             );
