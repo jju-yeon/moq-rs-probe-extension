@@ -717,6 +717,11 @@ pub async fn run_relay_probe_acceptor(
                                 req.probe_duration_ms,
                             );
 
+                            if remembered_media_bps.unwrap_or(0) >= current_paced_target {
+                                tokio::time::sleep(Duration::from_millis(PADDING_PACING_TICK_MS)).await;
+                                continue;
+                            }
+
                             let allowed_at_decision = paced_probe_allowed_bytes(
                                 target,
                                 decision_probe_elapsed_ms,
