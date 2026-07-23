@@ -19,3 +19,7 @@ qlog/
 .vscode/launch.json
 /target
 *.err
+*.zip
+*.ps1
+*.patch
+/padding_runs
