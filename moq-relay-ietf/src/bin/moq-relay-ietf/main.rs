@@ -20,7 +20,7 @@ pub struct Cli {
     #[arg(long, default_value = "[::]:443")]
     pub bind: net::SocketAddr,
 
-    //수정
+    /// Enable the staged receiver-goodput Probe extension.
     #[arg(long)]
     pub probe_enable: bool,
 
@@ -31,19 +31,6 @@ pub struct Cli {
     /// Maximum allowed probe target bitrate.
     #[arg(long, default_value = "100000000")]
     pub probe_max_target_bitrate: u64,
-
-    /// Correction growth limit in ppm. 1.25 = 1250000.
-    #[arg(long, default_value = "1250000")]
-    pub probe_growth_limit_ppm: u64,
-
-    /// Minimum accepted/attempted write ratio in ppm. 0.95 = 950000.
-    #[arg(long, default_value = "950000")]
-    pub probe_min_accept_ratio_ppm: u64,
-
-    /// Write lag threshold in ppm. 1.10 = 1100000.
-    #[arg(long, default_value = "1100000")]
-    pub probe_write_lag_threshold_ppm: u64,
-    //수정
 
     /// The TLS configuration.
     #[command(flatten)]
@@ -206,7 +193,6 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create a QUIC server for media.
-    //수정
     let relay = Relay::new(RelayConfig {
         tls: tls.clone(),
         bind: Some(cli.bind),

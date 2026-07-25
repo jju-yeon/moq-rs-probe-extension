@@ -16,6 +16,7 @@ use crate::{
     data,
     message::{self, FilterType, GroupOrder, Message},
     mlog,
+    probe::ReceiverProbeContext,
     serve::{self, ServeError},
 };
 
@@ -57,6 +58,9 @@ pub struct Subscriber {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Per-connection receiver measurement state shared with moq-sub.
+    probe: Arc<ReceiverProbeContext>,
 }
 
 impl Subscriber {
@@ -64,6 +68,7 @@ impl Subscriber {
         outgoing: Queue<Message>,
         next_requestid: Arc<atomic::AtomicU64>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        probe: Arc<ReceiverProbeContext>,
     ) -> Self {
         Self {
             announced: Default::default(),
@@ -74,7 +79,12 @@ impl Subscriber {
             next_requestid,
             mlog,
             subscribe_alias_notify: Arc::new(Notify::new()),
+            probe,
         }
+    }
+
+    pub fn probe_context(&self) -> Arc<ReceiverProbeContext> {
+        self.probe.clone()
     }
 
     /// Create an inbound/server QUIC connection, by accepting a bi-directional QUIC stream for control messages.
@@ -352,16 +362,60 @@ impl Subscriber {
             })?;
 
         if stream_type == crate::probe::PROBE_PADDING_STREAM_TYPE {
-            let mut total = 0u64;
-            while let Some(chunk) = stream.read(8192).await? {
-                total += chunk.len() as u64;
-            }
+            self.probe.on_padding_stream_open().map_err(|err| {
+                tracing::warn!(?err, "invalid Probe Padding stream state");
+                SessionError::Internal
+            })?;
 
-            if let Some(c) = crate::probe::counters() {
-                c.padding_stream_recv_bytes
-                    .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+            loop {
+                match stream.read(8192).await {
+                    Ok(Some(chunk)) => {
+                        self.probe
+                            .on_padding_payload(chunk.len(), std::time::Instant::now())
+                            .map_err(|err| {
+                                tracing::warn!(?err, "invalid Probe Padding payload state");
+                                SessionError::Internal
+                            })?;
+                    }
+                    Ok(None) => {
+                        self.probe.on_padding_stream_finished().map_err(|err| {
+                            tracing::warn!(?err, "invalid Probe Padding FIN state");
+                            SessionError::Internal
+                        })?;
+                        break;
+                    }
+                    Err(err) => {
+                        let reset_error_code = match stream.closed().await {
+                            Ok(code) => code.map(u32::from),
+                            Err(close_err) => {
+                                tracing::debug!(
+                                    ?close_err,
+                                    "failed to read Probe Padding stream close reason"
+                                );
+                                None
+                            }
+                        };
+                        self.probe
+                            .on_padding_stream_reset(reset_error_code)
+                            .map_err(|state_err| {
+                                tracing::warn!(?state_err, "invalid Probe Padding reset state");
+                                SessionError::Internal
+                            })?;
+                        if reset_error_code
+                            == Some(crate::probe::PROBE_PADDING_ABORTED_BACKPRESSURE)
+                        {
+                            tracing::debug!(?err, "Probe Padding stream reset for backpressure");
+                            break;
+                        }
+                        tracing::warn!(
+                            ?err,
+                            ?reset_error_code,
+                            "unexpected Probe Padding stream read failure"
+                        );
+                        return Err(err.into());
+                    }
+                }
             }
-
             return Ok(());
         }
 
@@ -768,7 +822,12 @@ mod tests {
     };
 
     fn subscriber() -> Subscriber {
-        Subscriber::new(Queue::default(), Arc::new(atomic::AtomicU64::new(0)), None)
+        Subscriber::new(
+            Queue::default(),
+            Arc::new(atomic::AtomicU64::new(0)),
+            None,
+            Arc::new(ReceiverProbeContext::default()),
+        )
     }
 
     #[tokio::test]

@@ -31,10 +31,10 @@ use std::sync::{atomic, Arc, Mutex};
 use crate::coding::{KeyValuePairs, Value};
 use crate::message::Message;
 use crate::mlog;
+use crate::probe::{ReceiverProbeContext, SenderProbeContext};
 use crate::watch::Queue;
 use crate::{message, setup};
 use std::path::PathBuf;
-use bytes::Buf;
 
 /// The transport protocol negotiated for this MoQT connection.
 ///
@@ -499,17 +499,21 @@ impl Session {
 
         // Wrap mlog in Arc<Mutex<>> for sharing across tasks
         let mlog_shared = mlog.map(|m| Arc::new(Mutex::new(m)));
+        let sender_probe = Arc::new(SenderProbeContext::default());
+        let receiver_probe = Arc::new(ReceiverProbeContext::default());
 
         let publisher = Some(Publisher::new(
             outgoing.0.clone(),
             webtransport.clone(),
             next_requestid.clone(),
             mlog_shared.clone(),
+            sender_probe,
         ));
         let subscriber = Some(Subscriber::new(
             outgoing.0,
             next_requestid,
             mlog_shared.clone(),
+            receiver_probe,
         ));
 
         let session = Self {
@@ -897,15 +901,11 @@ impl Session {
         mut subscriber: Option<Subscriber>,
     ) -> Result<(), SessionError> {
         loop {
-            //수정
             let datagram = webtransport.recv_datagram().await?;
             let mut b = datagram.clone();
             if let Ok(t) = crate::probe::get_varint(&mut b) {
                 if t == crate::probe::PROBE_PADDING_DATAGRAM_TYPE {
-                    if let Some(c) = crate::probe::counters() {
-                        c.padding_datagram_recv_bytes
-                            .fetch_add(b.remaining() as u64, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    tracing::warn!("Probe Padding datagrams are unsupported by staged Probe");
                     continue;
                 }
             }

@@ -13,6 +13,7 @@ use crate::{
     coding::TrackNamespace,
     message::{self, Message},
     mlog,
+    probe::SenderProbeContext,
     serve::{ServeError, TracksReader},
 };
 
@@ -55,6 +56,9 @@ pub struct Publisher {
 
     /// Optional mlog writer for logging transport events
     mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+
+    /// Per-connection application payload accounting used only for Probe pacing.
+    probe: Arc<SenderProbeContext>,
 }
 
 impl Publisher {
@@ -63,6 +67,7 @@ impl Publisher {
         webtransport: web_transport::Session,
         next_requestid: Arc<atomic::AtomicU64>,
         mlog: Option<Arc<Mutex<mlog::MlogWriter>>>,
+        probe: Arc<SenderProbeContext>,
     ) -> Self {
         Self {
             webtransport,
@@ -73,7 +78,16 @@ impl Publisher {
             outgoing,
             next_requestid,
             mlog,
+            probe,
         }
+    }
+
+    pub fn probe_context(&self) -> Arc<SenderProbeContext> {
+        self.probe.clone()
+    }
+
+    pub(crate) fn record_probe_media_payload(&self, bytes: usize) {
+        self.probe.record_media_payload(bytes);
     }
 
     pub async fn accept(

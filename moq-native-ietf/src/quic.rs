@@ -476,45 +476,31 @@ impl Server {
 
         let alpn_bytes = alpn.as_bytes();
         let (session, transport) = if alpn_bytes == web_transport_quinn::ALPN.as_bytes() {
-        let request = web_transport_quinn::Request::accept(conn)
-            .await
-            .context("failed to receive WebTransport request")?;
+            let request = web_transport_quinn::Request::accept(conn)
+                .await
+                .context("failed to receive WebTransport request")?;
 
-        let session = request
-            .ok()
-            .await
-            .context("failed to respond to WebTransport request")?;
+            let session = request
+                .ok()
+                .await
+                .context("failed to respond to WebTransport request")?;
 
-        if let Some(counters) = moq_transport::probe::counters() {
-            moq_transport::probe::spawn_cwnd_sampler(
-                session.clone(),
-                counters.clone(),
+            (session, Transport::WebTransport)
+        } else if alpn_bytes == moq_transport::setup::ALPN {
+            let request = url::Url::parse("moqt://localhost").unwrap();
+
+            let session = web_transport_quinn::Session::raw(
+                conn,
+                request,
+                web_transport_quinn::proto::ConnectResponse::default(),
             );
-        }
 
-        (session, Transport::WebTransport)
-    } else if alpn_bytes == moq_transport::setup::ALPN {
-        let request = url::Url::parse("moqt://localhost").unwrap();
+            (session, Transport::RawQuic)
+        } else {
+            anyhow::bail!("unsupported ALPN: {}", alpn)
+        };
 
-        let session = web_transport_quinn::Session::raw(
-            conn,
-            request,
-            web_transport_quinn::proto::ConnectResponse::default(),
-        );
-
-        if let Some(counters) = moq_transport::probe::counters() {
-            moq_transport::probe::spawn_cwnd_sampler(
-                session.clone(),
-                counters.clone(),
-            );
-        }
-
-        (session, Transport::RawQuic)
-    } else {
-        anyhow::bail!("unsupported ALPN: {}", alpn)
-    };
-
-    Ok((session.into(), connection_id_hex, transport))
+        Ok((session.into(), connection_id_hex, transport))
     }
 
     pub fn local_addr(&self) -> anyhow::Result<net::SocketAddr> {

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::ops;
-use std::sync::{atomic::Ordering, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -13,7 +13,6 @@ use crate::mlog;
 use crate::serve::{ServeError, TrackReaderMode};
 use crate::watch::State;
 use crate::{data, message, serve};
-use crate::probe;
 
 use super::{Publisher, SessionError, SubscribeInfo, Writer};
 
@@ -46,19 +45,6 @@ impl Default for SubscribedState {
         }
     }
 }
-
-#[inline]
-fn record_media_write_bytes(bytes: usize) {
-    if bytes == 0 {
-        return;
-    }
-    if let Some(counters) = probe::counters() {
-        counters
-            .media_write_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-}
-
 
 pub struct Subscribed {
     /// The sessions Publisher manager, used to send control messages,
@@ -351,7 +337,7 @@ impl Subscribed {
                 );
                 bytes_sent += chunk.len();
                 writer.write(&chunk).await?;
-                record_media_write_bytes(chunk.len());
+                publisher.record_probe_media_payload(chunk.len());
                 chunks_sent += 1;
             }
 
@@ -438,9 +424,8 @@ impl Subscribed {
                 }
             }
 
-            let media_datagram_bytes = buffer.len();
             self.publisher.send_datagram(buffer.into()).await?;
-            record_media_write_bytes(media_datagram_bytes);
+            self.publisher.record_probe_media_payload(payload_len);
 
             self.state
                 .lock_mut()

@@ -54,7 +54,7 @@ pub struct RelayConfig {
     /// The coordinator for namespace/track registration and discovery.
     pub coordinator: Arc<dyn Coordinator>,
 
-    //수정
+    /// Experimental staged Probe configuration.
     pub probe: moq_transport::probe::ProbeConfig,
 }
 
@@ -66,7 +66,6 @@ pub struct Relay {
     locals: Locals,
     remotes: RemoteManager,
     coordinator: Arc<dyn Coordinator>,
-    //수정
     probe: moq_transport::probe::ProbeConfig,
 }
 
@@ -120,7 +119,6 @@ impl Relay {
             locals,
             remotes,
             coordinator: config.coordinator,
-            //수정
             probe: config.probe,
         })
     }
@@ -136,9 +134,6 @@ impl Relay {
             coordinator,
             probe,
         } = self;
-
-        let probe_counters = Arc::new(moq_transport::probe::ProbeCounters::default());
-        moq_transport::probe::install_global_counters(probe_counters.clone());
 
         let run_result = async {
             let mut tasks = FuturesUnordered::new();
@@ -256,7 +251,6 @@ impl Relay {
                         let forward = forward_producer.clone();
                         let coordinator = coordinator.clone();
                         let probe_config = probe.clone();
-                        let probe_counters = probe_counters.clone();
 
                         // Spawn a new task to handle the connection
                         tasks.push(async move {
@@ -278,24 +272,9 @@ impl Relay {
                                     return Ok(());
                                 }
                             };
-
-                            if probe_config.enabled {
-                                let probe_wt = raw_conn.clone();
-                                let probe_config_for_task = probe_config.clone();
-                                let probe_counters_for_task = probe_counters.clone();
-
-                                tokio::spawn(async move {
-                                    if let Err(err) = moq_transport::probe::run_relay_probe_acceptor(
-                                        probe_wt,
-                                        probe_config_for_task,
-                                        probe_counters_for_task,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(?err, "probe acceptor stopped");
-                                    }
-                                });
-                            }
+                            let probe_context = publisher
+                                .as_ref()
+                                .map(|publisher| publisher.probe_context());
 
                             // Create our MoQ relay session
                             let moq_session = session;
@@ -366,7 +345,32 @@ impl Relay {
                                 reject_subscribes,
                             };
 
-                            match session.run().await {
+                            let probe_task = if probe_config.enabled {
+                                let probe_wt = raw_conn.clone();
+                                let probe_context = probe_context
+                                    .expect("accepted sessions always have a publisher");
+                                Some(tokio::spawn(async move {
+                                    if let Err(err) = moq_transport::probe::run_relay_probe_acceptor(
+                                        probe_wt,
+                                        probe_config,
+                                        probe_context,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!(?err, "probe acceptor stopped");
+                                    }
+                                }))
+                            } else {
+                                None
+                            };
+
+                            let session_result = session.run().await;
+                            if let Some(probe_task) = probe_task {
+                                probe_task.abort();
+                                let _ = probe_task.await;
+                            }
+
+                            match session_result {
                                 Ok(()) => {
                                     // Session ended cleanly (uncommon - usually ends via close)
                                     metrics::counter!("moq_relay_connections_closed_total").increment(1);

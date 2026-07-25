@@ -5,6 +5,7 @@
 use std::{io::Cursor, sync::Arc};
 
 use anyhow::Context;
+use moq_transport::probe::ReceiverProbeContext;
 use moq_transport::serve::{
     SubgroupObjectReader, SubgroupReader, TrackReader, TrackReaderMode, Tracks, TracksReader,
     TracksWriter,
@@ -24,6 +25,7 @@ pub struct Media<O> {
     tracks_writer: TracksWriter,
     output: Arc<Mutex<O>>,
     request_catalog: bool,
+    probe: Arc<ReceiverProbeContext>,
 }
 
 impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
@@ -33,6 +35,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         output: O,
         request_catalog: bool,
     ) -> anyhow::Result<Self> {
+        let probe = subscriber.probe_context();
         let (tracks_writer, _tracks_request, tracks_reader) = tracks.produce();
         let broadcast = tracks_reader; // breadcrumb for navigating API name changes
         Ok(Self {
@@ -41,10 +44,15 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             tracks_writer,
             output: Arc::new(Mutex::new(output)),
             request_catalog,
+            probe,
         })
     }
 
-    pub async fn run(&mut self) -> anyhow::Result<()> {
+    /// Download metadata and subscribe to the selected media tracks.
+    ///
+    /// Probe starts only after this completes, so catalog/init payload is not
+    /// mixed into the sender-side media baseline for a measurement stage.
+    pub async fn initialize(&mut self) -> anyhow::Result<Vec<TrackReader>> {
         let catalog = if self.request_catalog {
             // The catalog track has no standardized name, but
             // both moq-pub of moq-rs and gst-moq-pub uses ".catalog".
@@ -119,13 +127,18 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             }
         }
 
+        Ok(tracks)
+    }
+
+    pub async fn run(&mut self, tracks: Vec<TrackReader>) -> anyhow::Result<()> {
         info!("playing {} tracks", tracks.len());
         let mut tasks = JoinSet::new();
         for track in tracks {
             let out = self.output.clone();
+            let probe = self.probe.clone();
             tasks.spawn(async move {
                 let name = track.name.clone();
-                if let Err(err) = Self::recv_track(track, out).await {
+                if let Err(err) = Self::recv_track(track, out, probe).await {
                     warn!("failed to play track {name}: {err:?}");
                 }
             });
@@ -170,13 +183,17 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         Ok(buf)
     }
 
-    async fn recv_track(track: TrackReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
+    async fn recv_track(
+        track: TrackReader,
+        out: Arc<Mutex<O>>,
+        probe: Arc<ReceiverProbeContext>,
+    ) -> anyhow::Result<()> {
         let name = track.name.clone();
         debug!("track {name}: start");
         if let TrackReaderMode::Subgroups(mut groups) = track.mode().await? {
             while let Some(group) = groups.next().await? {
                 let out = out.clone();
-                if let Err(err) = Self::recv_group(group, out).await {
+                if let Err(err) = Self::recv_group(group, out, probe.clone()).await {
                     warn!("failed to receive group: {err:?}");
                 }
             }
@@ -185,7 +202,11 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
         Ok(())
     }
 
-    async fn recv_group(mut group: SubgroupReader, out: Arc<Mutex<O>>) -> anyhow::Result<()> {
+    async fn recv_group(
+        mut group: SubgroupReader,
+        out: Arc<Mutex<O>>,
+        probe: Arc<ReceiverProbeContext>,
+    ) -> anyhow::Result<()> {
         trace!("group={} start", group.group_id);
 
         while let Some(object) = group.next().await? {
@@ -196,28 +217,23 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
             );
 
             let out = out.clone();
-            Self::recv_object_to_output(object, out).await?;
+            Self::recv_object_to_output(object, out, probe.clone()).await?;
         }
 
         Ok(())
-}
+    }
 
-    
     async fn recv_object_to_output(
         mut object: SubgroupObjectReader,
         out: Arc<Mutex<impl AsyncWrite + Unpin>>,
+        probe: Arc<ReceiverProbeContext>,
     ) -> anyhow::Result<()> {
         while let Some(chunk) = object.read().await? {
             if chunk.is_empty() {
                 continue;
             }
 
-            if let Some(c) = moq_transport::probe::counters() {
-                c.media_recv_bytes.fetch_add(
-                    chunk.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
+            probe.on_media_payload(chunk.len(), std::time::Instant::now());
 
             let mut output = out.lock().await;
             output.write_all(&chunk).await?;
@@ -226,7 +242,7 @@ impl<O: AsyncWrite + Send + Unpin + 'static> Media<O> {
 
         Ok(())
     }
-async fn recv_object(mut object: SubgroupObjectReader) -> anyhow::Result<Vec<u8>> {
+    async fn recv_object(mut object: SubgroupObjectReader) -> anyhow::Result<Vec<u8>> {
         let mut buf = Vec::with_capacity(object.size);
         while let Some(chunk) = object.read().await? {
             buf.extend_from_slice(&chunk);

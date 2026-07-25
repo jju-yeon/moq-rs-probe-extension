@@ -4,7 +4,7 @@
 
 use std::{
     net,
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -41,44 +41,58 @@ async fn main() -> anyhow::Result<()> {
         connection_id
     );
 
-    let counters = Arc::new(probe::ProbeCounters::default());
-    probe::install_global_counters(counters.clone());
-
     let (session, subscriber) = moq_transport::session::Subscriber::connect(session, transport)
         .await
         .context("failed to create MoQ Transport session")?;
-
-    if config.probe_enable {
-        let probe_config = config.clone();
-        let probe_counters = counters.clone();
-        tokio::spawn(async move {
-            if let Err(err) = run_probe_client(probe_wt, probe_config, probe_counters).await {
-                tracing::warn!(?err, "probe client stopped");
-            }
-        });
-    }
+    let probe_context = subscriber.probe_context();
 
     // Associate empty set of Tracks with provided namespace
     let tracks = Tracks::new(TrackNamespace::from_utf8_path(&config.name));
 
     let mut media = Media::new(subscriber, tracks, out, config.catalog).await?;
+    let session = session.run();
+    tokio::pin!(session);
+
+    let media_tracks = tokio::select! {
+        res = &mut session => return res.context("session error"),
+        res = media.initialize() => res.context("media initialization error")?,
+    };
+
+    let probe_task = if config.probe_enable && config.probe_count > 0 {
+        let probe_config = config.clone();
+        Some(tokio::spawn(async move {
+            if let Err(err) = run_probe_client(probe_wt, probe_config, probe_context).await {
+                tracing::warn!(?err, "probe client stopped");
+            }
+        }))
+    } else {
+        None
+    };
 
     tokio::select! {
-        res = session.run() => res.context("session error")?,
-        res = media.run() => res.context("media error")?,
+        res = &mut session => res.context("session error")?,
+        res = media.run(media_tracks) => res.context("media error")?,
+    }
+
+    if let Some(task) = probe_task {
+        task.abort();
+        let _ = task.await;
     }
 
     Ok(())
 }
 
 #[derive(Parser, Clone)]
-//수정
 pub struct Config {
     /// Listen for UDP packets on the given address.
     #[arg(long, default_value = "[::]:0")]
     pub bind: net::SocketAddr,
 
-    #[arg(long, default_value = "1")]
+    #[arg(
+        long,
+        default_value = "1",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub probe_count: u64,
 
     #[arg(long, default_value = "1000")]
@@ -100,8 +114,6 @@ pub struct Config {
     #[arg(long)]
     pub catalog: bool,
 
-    // 여기부터 추가
-
     /// Enable MoQ Probe experiment.
     #[arg(long)]
     pub probe_enable: bool,
@@ -111,36 +123,47 @@ pub struct Config {
     pub probe_target_bitrate: u64,
 
     /// Probe duration in milliseconds.
-    #[arg(long, default_value = "3000")]
+    #[arg(
+        long,
+        default_value = "3000",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub probe_duration_ms: u64,
 
     /// Probe epoch duration in milliseconds.
-    #[arg(long, default_value = "500")]
+    #[arg(
+        long,
+        default_value = "500",
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub probe_epoch_ms: u64,
 
-
-    /// Probe padding mode: stream or datagram.
-    #[arg(long, default_value = "stream")]
+    /// Probe padding mode. The staged protocol supports only streams.
+    #[arg(long, default_value = "stream", value_parser = ["stream"])]
     pub probe_padding_mode: String,
 
     /// Subscriber-side probe CSV log path.
     #[arg(long)]
     pub probe_log: Option<std::path::PathBuf>,
-
 }
-
 
 async fn run_probe_client(
     wt: web_transport::Session,
     config: Config,
-    counters: Arc<probe::ProbeCounters>,
+    context: Arc<probe::ReceiverProbeContext>,
 ) -> anyhow::Result<()> {
-    let padding_mode = match config.probe_padding_mode.as_str() {
-        "stream" => probe::PaddingMode::Stream,
-        "datagram" => probe::PaddingMode::Datagram,
-        other => anyhow::bail!("invalid --probe-padding-mode: {other}"),
-    };
-
+    anyhow::ensure!(
+        config.probe_padding_mode == "stream",
+        "--probe-padding-mode must be stream for staged Probe"
+    );
+    anyhow::ensure!(
+        config.probe_duration_ms > 0,
+        "--probe-duration-ms must be greater than zero"
+    );
+    anyhow::ensure!(
+        config.probe_epoch_ms > 0,
+        "--probe-epoch-ms must be greater than zero"
+    );
 
     let log = config
         .probe_log
@@ -149,114 +172,114 @@ async fn run_probe_client(
 
     let mut csv = probe::SubscriberProbeCsv::new(log)?;
 
-
-    for i in 0..config.probe_count {
-        let request_id = probe::now_ms();
-
-        let media_start = counters.media_recv_bytes.load(Ordering::Relaxed);
-        let ps_start = counters.padding_stream_recv_bytes.load(Ordering::Relaxed);
-        let pd_start = counters.padding_datagram_recv_bytes.load(Ordering::Relaxed);
-
-        let started = Instant::now();
-
+    for logical_index in 0..config.probe_count {
+        let request_id = probe::now_ms().saturating_add(logical_index);
+        let logical_started = Instant::now();
         let (mut send, mut recv) = wt.open_bi().await?;
-		let _ = send.set_priority(probe::PROBE_PRIORITY);
+        send.set_priority(probe::PROBE_CONTROL_PRIORITY);
 
         probe::write_varint_web(&mut send, probe::PROBE_STREAM_TYPE).await?;
+        probe::write_varint_web(&mut send, probe::PROBE_PROTOCOL_VERSION).await?;
 
-        let req = probe::ProbeRequest {
-            request_id,
-            target_bitrate_bps: config.probe_target_bitrate,
-            probe_duration_ms: config.probe_duration_ms,
-            epoch_ms: config.probe_epoch_ms,
-            padding_mode,
-        };
+        let mut highest_validated_target_bps = 0u64;
+        let mut logical_status = "COMPLETED";
 
-        let raw_req = probe::encode_probe_request(&req);
-        probe::write_all_web(&mut send, &raw_req).await?;
-
-        send.finish()?;
-
-        let mut sample_index = 0u64;
-
-        let mut media_last = media_start;
-        let mut ps_last = ps_start;
-        let mut pd_last = pd_start;
-
-        let mut last_sample_at = Instant::now();
-
-        loop {
-            let res = match probe::read_probe_response_web(&mut recv).await {
-                Ok(res) => res,
-                Err(probe::ProbeError::EndOfStream) => break,
-                Err(err) => return Err(err.into()),
-            };
-
-            sample_index += 1;
-
-            let sample_elapsed_ms = last_sample_at.elapsed().as_millis().max(1) as u64;
-            last_sample_at = Instant::now();
-
-            let probe_elapsed_ms = started.elapsed().as_millis().max(1) as u64;
-
-            let media_now = counters.media_recv_bytes.load(Ordering::Relaxed);
-            let ps_now = counters.padding_stream_recv_bytes.load(Ordering::Relaxed);
-            let pd_now = counters.padding_datagram_recv_bytes.load(Ordering::Relaxed);
-
-            let media = media_now.saturating_sub(media_last);
-            let padding_stream = ps_now.saturating_sub(ps_last);
-            let padding_datagram = pd_now.saturating_sub(pd_last);
-
-            media_last = media_now;
-            ps_last = ps_now;
-            pd_last = pd_now;
-
-            let total_received = media
-                .saturating_add(padding_stream)
-                .saturating_add(padding_datagram);
-
-            let receiver_goodput_bps = probe::bitrate_bps(total_received, sample_elapsed_ms);
-
-            csv.row(
-                res.request_id,
-                sample_index,
-                probe_elapsed_ms,
-                res.elapsed_ms,
-                media,
-                padding_stream,
-                padding_datagram,
-                receiver_goodput_bps,
-                res.sender_app_written_bytes,
-                res.media_written_bytes,
-                res.padding_written_bytes,
-                res.raw_sender_app_bitrate_bps,
-                res.target_bitrate_bps,
-                res.paced_target_bps,
-                res.cwnd_bytes,
+        for (stage_index, ratio) in probe::DEFAULT_STAGE_RATIOS_PERCENT.iter().enumerate() {
+            let stage_target = probe::stage_target_bps(config.probe_target_bitrate, *ratio);
+            context.begin_stage(
+                request_id,
+                stage_index as u64,
+                *ratio,
+                stage_target,
+                probe::DEFAULT_STAGE_PASS_PERCENT,
             )?;
 
-            tracing::info!(
-                request_id = res.request_id,
-                sample_index,
-                probe_index = i + 1,
-                probe_count = config.probe_count,
-                target_bitrate_bps = res.target_bitrate_bps,
-                paced_target_bps = res.paced_target_bps,
-                raw_sender_app_bitrate_bps = res.raw_sender_app_bitrate_bps,
-                receiver_goodput_bps,
-                "probe sample received"
-            );
+            let request = probe::ProbeRequest {
+                request_id,
+                stage_index: stage_index as u64,
+                stage_ratio_percent: *ratio,
+                stage_target_bps: stage_target,
+                active_duration_ms: config.probe_duration_ms,
+                epoch_ms: config.probe_epoch_ms,
+            };
+            probe::write_probe_message_web(
+                &mut send,
+                &probe::ProbeMessage::Request(request.clone()),
+            )
+            .await?;
+
+            let start = match probe::read_probe_message_web(&mut recv).await? {
+                probe::ProbeMessage::Start(start) => start,
+                _ => anyhow::bail!("expected PROBE_START"),
+            };
+            context.on_probe_start(&start, Instant::now())?;
+            probe::write_probe_message_web(
+                &mut send,
+                &probe::ProbeMessage::StartAck(probe::ProbeStartAck {
+                    request_id,
+                    stage_index: stage_index as u64,
+                }),
+            )
+            .await?;
+
+            let end = match probe::read_probe_message_web(&mut recv).await? {
+                probe::ProbeMessage::End(end) => end,
+                _ => anyhow::bail!("expected PROBE_END"),
+            };
+            let mut result = context.on_probe_end(&end, Instant::now())?;
+            context.wait_for_padding_cleanup().await;
+            context.refresh_after_padding_cleanup(&mut result)?;
+
+            if result.stage_passed {
+                highest_validated_target_bps = stage_target;
+                tracing::info!(
+                    request_id,
+                    stage_index,
+                    stage_target_bps = stage_target,
+                    receiver_goodput_bps = result.receiver_goodput_bps,
+                    "STAGE_PASSED"
+                );
+            } else {
+                logical_status = match result.status {
+                    probe::StageStatus::AbortedBackpressure => "ABORTED_BACKPRESSURE",
+                    _ if stage_index == 0 => "VALIDATION_FAILED",
+                    _ if stage_index == 1 => "VALIDATION_FAILED_AT_75",
+                    _ => "VALIDATION_FAILED_AT_100",
+                };
+                tracing::info!(
+                    request_id,
+                    stage_index,
+                    stage_target_bps = stage_target,
+                    receiver_goodput_bps = result.receiver_goodput_bps,
+                    ?result.status,
+                    "STAGE_FAILED"
+                );
+            }
+
+            csv.row(
+                logical_index + 1,
+                &result,
+                highest_validated_target_bps,
+                logical_status,
+            )?;
+
+            if !result.stage_passed {
+                break;
+            }
         }
 
+        send.finish()?;
         tracing::info!(
             request_id,
-            probe_index = i + 1,
+            probe_index = logical_index + 1,
             probe_count = config.probe_count,
-            samples = sample_index,
-            "probe completed"
+            highest_validated_target_bps,
+            logical_probe_wall_clock_ms = logical_started.elapsed().as_millis() as u64,
+            logical_status,
+            "LOGICAL_PROBE_COMPLETED"
         );
 
-        if i + 1 < config.probe_count {
+        if logical_index + 1 < config.probe_count {
             tokio::time::sleep(Duration::from_millis(config.probe_interval_ms)).await;
         }
     }
@@ -273,4 +296,37 @@ fn moq_url(s: &str) -> Result<Url, String> {
     }
 
     Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_probe_args(extra: &[&str]) -> Result<Config, clap::Error> {
+        let mut args = vec!["moq-sub", "--name", "test", "https://localhost/"];
+        args.extend_from_slice(extra);
+        Config::try_parse_from(args)
+    }
+
+    #[test]
+    fn staged_probe_rejects_datagram_padding() {
+        let error = match parse_probe_args(&["--probe-padding-mode", "datagram"]) {
+            Ok(_) => panic!("datagram padding unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("stream"));
+    }
+
+    #[test]
+    fn staged_probe_rejects_zero_durations() {
+        assert!(parse_probe_args(&["--probe-count", "0"]).is_err());
+        assert!(parse_probe_args(&["--probe-duration-ms", "0"]).is_err());
+        assert!(parse_probe_args(&["--probe-epoch-ms", "0"]).is_err());
+    }
+
+    #[test]
+    fn staged_probe_allows_target_zero() {
+        let config = parse_probe_args(&["--probe-target-bitrate", "0"]).unwrap();
+        assert_eq!(config.probe_target_bitrate, 0);
+    }
 }
